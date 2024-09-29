@@ -41,7 +41,7 @@ type IvreJA3CStore: record {
     e_curves:     vector of string &default=vector() &log;
     ec_point_fmt: vector of string &default=vector() &log;
     sni:          string &default="i" &log;
-    alpn:         string &default="00" &log;
+    alpn:         string &default="--" &log;
     version:      count &default=0 &log;
     signatures:   vector of string &default=vector() &log;
 };
@@ -138,15 +138,23 @@ event ssl_extension_server_name(c: connection, is_orig: bool, names: string_vec)
 }
 
 event ssl_extension_application_layer_protocol_negotiation(c: connection, is_orig: bool, protocols: string_vec) {
-    if (is_orig && |protocols| > 0) {
+    if (is_orig) {
         if (! c?$ivreja3c) {
             c$ivreja3c = IvreJA3CStore();
         }
         # Only use the first instance of the extension
-        if (c$ivreja3c$alpn == "00") {
-            c$ivreja3c$alpn = protocols[0][0] + protocols[0][-1];
-            if (!is_ascii(c$ivreja3c$alpn)) {
-                c$ivreja3c$alpn = "99";
+        if (c$ivreja3c$alpn == "--") {
+            if (|protocols| > 0 && |protocols[0]| > 0) {
+                local alpn = protocols[0][0] + protocols[0][-1];
+                # is_alnum() does not exist before Zeek 4.0.0
+                if (/^[0-9a-fA-F]{2}$/ !in alpn) {
+                    alpn = string_to_ascii_hex(alpn);
+                    alpn = alpn[0] + alpn[-1];
+                }
+                c$ivreja3c$alpn = alpn;
+            }
+            else {
+                c$ivreja3c$alpn = "00";
             }
         }
     }
@@ -172,7 +180,13 @@ event ssl_extension_supported_versions(c: connection, is_orig: bool, versions: i
         if (! c?$ivreja3c) {
             c$ivreja3c = IvreJA3CStore();
         }
-        c$ivreja3c$version = versions[0];
+        for (i in versions) {
+            local value = versions[i];
+            if (value !in grease) {
+                c$ivreja3c$version = value;
+                break;
+            }
+        }
     }
 }
 
@@ -241,7 +255,11 @@ event ssl_client_hello(c: connection, version: count, record_version: count, pos
         ja4_a += "t";
     }
     else if (proto == udp) {
+@if(Version::number >= 60100)
+        if (c?$quic || "QUIC" in c$service) {
+@else
         if ("QUIC" in c$service) {
+@endif
             ja4_a += "q";
         }
         else {
@@ -277,13 +295,16 @@ event ssl_client_hello(c: connection, version: count, record_version: count, pos
         ja4_a += fmt("%02d", |c$ivreja3c$extensions|);
     }
     # ALPN, collected in ssl_extension_application_layer_protocol_negotiation()
-    ja4_a += c$ivreja3c$alpn;
+    ja4_a += (c$ivreja3c$alpn == "--") ? "00" : c$ivreja3c$alpn;
+    local ja4_a_s = join_string_vec(ja4_a, "");
 
     local ciphers_sorted: vector of string = vector();
     for (i in ciphers_string) {
         ciphers_sorted += fmt("%04x", to_count(ciphers_string[i]));
     }
     sort(ciphers_sorted, strcmp);
+
+    local ja4_b_s = join_string_vec(ciphers_sorted, ",");
 
     local ext_sorted: vector of string = vector();
     for (i in c$ivreja3c$extensions) {
@@ -293,19 +314,15 @@ event ssl_client_hello(c: connection, version: count, record_version: count, pos
     }
     sort(ext_sorted, strcmp);
 
-    c$ssl$ivreja4c_raw = fmt(
-        "%s_%s_%s_%s",
-        join_string_vec(ja4_a, ""),
-        join_string_vec(ciphers_sorted, ","),
-        join_string_vec(ext_sorted, ","),
-	join_string_vec(c$ivreja3c$signatures, ",")
-    );
-    c$ssl$ivreja4c = fmt(
-        "%s_%s_%s",
-        join_string_vec(ja4_a, ""),
-        sha256_hash(join_string_vec(ciphers_sorted, ","))[:12],
-        sha256_hash(join_string_vec(ext_sorted, ",") + "_" + join_string_vec(c$ivreja3c$signatures, ","))[:12]
-    );
+    local ja4_c: vector of string = vector();
+    ja4_c += join_string_vec(ext_sorted, ",");
+    if (|c$ivreja3c$signatures| > 0) {
+        ja4_c += join_string_vec(c$ivreja3c$signatures, ",");
+    }
+    local ja4_c_s = join_string_vec(ja4_c, "_");
+
+    c$ssl$ivreja4c_raw = fmt("%s_%s_%s", ja4_a_s, ja4_b_s, ja4_c_s);
+    c$ssl$ivreja4c = fmt("%s_%s_%s", ja4_a_s, sha256_hash(ja4_b_s)[:12], sha256_hash(ja4_c_s)[:12]);
 }
 
 event ssl_server_hello(c: connection, version: count, record_version: count, possible_ts: time, server_random: string, session_id: string, cipher: count, comp_method: count) &priority=1

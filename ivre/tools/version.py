@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2023 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,57 +22,15 @@
 
 import os
 import sys
-from importlib import import_module
-
-try:
-    from importlib.metadata import entry_points
-except ImportError:
-    HAS_PLUGINS = False
-else:
-    HAS_PLUGINS = True
-from typing import Dict, List, Optional, Set, Tuple
 
 from ivre import VERSION
-
-
-def get_version(module: str) -> Optional[str]:
-    try:
-        mod = import_module(module)
-    except ImportError:
-        return None
-    for attr in ["__version__", "VERSION", "version"]:
-        try:
-            data = getattr(mod, attr)
-        except AttributeError:
-            continue
-        if isinstance(data, tuple):
-            return ".".join(str(value) for value in data)
-        return str(data)
-    return "[unknown version]"
-
-
-def list_plugins() -> Optional[Dict[str, List[Tuple[str, Optional[str]]]]]:
-    if not HAS_PLUGINS:
-        return None
-    modules: Dict[str, Set[str]] = {}
-    for category in ["view"]:
-        group = f"ivre.plugins.{category}"
-        try:
-            my_entry_points = entry_points(group=group)
-        except TypeError:
-            my_entry_points = entry_points().get(group, [])  # type: ignore
-        for entry_point in my_entry_points:
-            modules.setdefault(category, set()).add(entry_point.module)
-    return {
-        category: sorted((module, get_version(module)) for module in sorted(modules))
-        for category, modules in modules.items()
-    }
+from ivre.plugins import get_version, list_plugins
 
 
 def main() -> None:
     """Display IVRE's version"""
     print("IVRE - Network recon framework")
-    print("Copyright 2011 - 2023 Pierre LALET <pierre@droids-corp.org>")
+    print("Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>")
     print("Version %s" % VERSION)
     print()
     print("Python %s" % sys.version)

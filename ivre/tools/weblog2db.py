@@ -27,8 +27,7 @@ from typing import BinaryIO, Dict, Generator, Iterable, List, Optional, Tuple, U
 
 from ivre.db import DBPassive, db
 from ivre.parser.weblog import WeblogFile
-from ivre.passive import getinfos, handle_rec
-from ivre.tools.passiverecon2db import _get_ignore_rules
+from ivre.passive import get_ignore_rules, getinfos, handle_rec
 from ivre.types import Record
 from ivre.utils import recursive_filelisting
 
@@ -45,31 +44,32 @@ def rec_iter(
             for line in fdesc:
                 if not line:
                     continue
-                if line.get("useragent") and line["useragent"] != "-":
-                    yield from handle_rec(
-                        # sensor
-                        sensor,
-                        # ignorenets,
-                        ignorenets,
-                        # neverignore,
-                        neverignore,
-                        # timestamp
-                        timestamp=line["ts"],
-                        # uid
-                        uid=None,
-                        # host
-                        host=line["host"],
-                        # srvport
-                        srvport=None,
-                        # recon_type
-                        recon_type="HTTP_CLIENT_HEADER",
-                        # source
-                        source="USER-AGENT",
-                        # value
-                        value=line["useragent"],
-                        # targetval
-                        targetval=None,
-                    )
+                for field in ["user-agent", "x-forwarded-for"]:
+                    if line.get(field):
+                        yield from handle_rec(
+                            # sensor
+                            sensor,
+                            # ignorenets,
+                            ignorenets,
+                            # neverignore,
+                            neverignore,
+                            # timestamp
+                            timestamp=line["ts"],
+                            # uid
+                            uid=None,
+                            # host
+                            host=line["host"],
+                            # srvport
+                            srvport=None,
+                            # recon_type
+                            recon_type="HTTP_CLIENT_HEADER",
+                            # source
+                            source=field.upper(),
+                            # value
+                            value=line[field],
+                            # targetval
+                            targetval=None,
+                        )
 
 
 def main() -> None:
@@ -79,7 +79,7 @@ def main() -> None:
         "files", nargs="*", metavar="FILE", help="http server log files"
     )
     args = parser.parse_args()
-    ignore_rules = _get_ignore_rules(args.ignore_spec)
+    ignore_rules = get_ignore_rules(args.ignore_spec)
     if args.test:
         function = DBPassive().insert_or_update_local_bulk
     elif (not (args.no_bulk or args.local_bulk)) or args.bulk:

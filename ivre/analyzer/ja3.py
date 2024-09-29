@@ -99,7 +99,7 @@ def banner2ja34c(
         ecsg: List[int] = []
         ecpf: List[int] = []
         sni = "i"
-        alpn = "00"
+        alpn = "--"
         version = msg.version
         signatures = []
         for ext in msg.ext or []:
@@ -113,17 +113,22 @@ def banner2ja34c(
             elif ext.type == 13:  # signatures
                 if ext.sig_algs:
                     signatures = [s for s in ext.sig_algs if s not in GREASE]
-            elif ext.type == 16:  # ALPN
-                if ext.protocols:
-                    alpn = ext.protocols[0] + ext.protocols[-1]
-                    if not alpn.isascii():
-                        alpn = "99"
+            elif ext.type == 16 and alpn == "--":  # ALPN
+                if ext.protocols and ext.protocols[0].protocol:
+                    alpn_b = ext.protocols.protocol[0] + ext.protocols.protocol[-1]
+                    if alpn.isalnum():
+                        alpn = alpn_b.decode()
+                    else:
+                        alpn = alpn_b.hex()
+                        alpn = alpn[0] + alpn[-1]
+                else:
+                    alpn = "00"
             elif ext.type == 43:  # supported_versions
                 if ext.versions:
                     version = ext.versions[0]
         output_ja3.append("-".join(str(v) for v in ecsg))
         output_ja3.append("-".join(str(v) for v in ecpf))
-        output_ja4_a = f"{protocol}{JA4_VERSIONS.get(version, '??')}{sni}{min(len(ciphers), 99)}{min(len(exts), 99)}{alpn}"
+        output_ja4_a = f"{protocol}{JA4_VERSIONS.get(version, '??')}{sni}{min(len(ciphers), 99)}{min(len(exts), 99)}{'00' if alpn == '--' else alpn}"
         output_ja4_b = ",".join("%04x" % c for c in sorted(ciphers))
         output_ja4_c1 = ",".join("%04x" % c for c in sorted(exts) if c not in {0, 16})
         output_ja4_c2 = ",".join("%04x" % c for c in signatures)
@@ -166,9 +171,11 @@ def banner2scripts(
         "ssl-ja3-client": [structured_ja3],
     }
     ja4_b = hashlib.new("sha256", data=output_ja4_b.encode()).hexdigest()[:12]
-    ja4_c = hashlib.new(
-        "sha256", data=f"{output_ja4_c1}_{output_ja4_c2}".encode()
-    ).hexdigest()[:12]
+    if output_ja4_c2:
+        output_ja4_c = f"{output_ja4_c1}_{output_ja4_c2}"
+    else:
+        output_ja4_c = output_ja4_c1
+    ja4_c = hashlib.new("sha256", data=output_ja4_c.encode()).hexdigest()[:12]
     ja4 = f"{output_ja4_a}_{ja4_b}_{ja4_c}"
     script_ja4 = {
         "id": "ssl-ja4-client",

@@ -22,6 +22,8 @@ backends.
 
 """
 
+import base64
+import binascii
 import json
 import os
 import pickle
@@ -54,14 +56,15 @@ except ImportError:
 from ivre import config, flow, nmapout, passive, utils, xmlnmap
 from ivre.active.cpe import add_cpe_values
 from ivre.active.data import (
-    ALIASES_TABLE_ELEMS,
     add_cert_hostnames,
     create_ssl_cert,
     handle_http_content,
     handle_http_headers,
     merge_host_docs,
 )
+from ivre.active.nmap import ALIASES_TABLE_ELEMS
 from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
+from ivre.plugins import load_plugins
 from ivre.tags import add_tags, gen_addr_tags
 from ivre.tags.active import set_auto_tags
 from ivre.zgrabout import ZGRAB_PARSERS
@@ -100,6 +103,19 @@ class DB:
     def __init__(self):
         self.argparser = ArgumentParser(add_help=False)
         self.argparser.add_argument(
+            "--id",
+            metavar="ID",
+            help="show only results with this(those) ID(s)",
+            nargs="+",
+        )
+        self.argparser.add_argument(
+            "--no-id",
+            metavar="ID",
+            help="show only results WITHOUT this(those) ID(s)",
+            nargs="+",
+        )
+        self.argparser.add_argument("--version", metavar="VERSION", type=int)
+        self.argparser.add_argument(
             "--category", metavar="CAT", help="show only results from this category"
         )
         self.argparser.add_argument("--port", metavar="PORT")
@@ -118,6 +134,8 @@ class DB:
         self.argparser.add_argument(
             "--hassh", metavar="VALUE_OR_HASH", nargs="?", const=False, default=None
         )
+        self.argparser.add_argument("--hostname", metavar="NAME / ~NAME")
+        self.argparser.add_argument("--domain", metavar="NAME / ~NAME")
         self.argparser.add_argument(
             "--hassh-server",
             metavar="VALUE_OR_HASH",
@@ -132,6 +150,8 @@ class DB:
             const=False,
             default=None,
         )
+        self.argparser.add_argument("--cert", metavar="FINGERPRINT")
+        self.argparser.add_argument("--torcert", action="store_true")
         self.argparser.add_argument(
             "ips",
             nargs="*",
@@ -141,6 +161,12 @@ class DB:
     def parse_args(self, args, flt=None):
         if flt is None:
             flt = self.flt_empty
+        if args.id is not None:
+            flt = self.flt_and(flt, self.searchobjectid(args.id))
+        if args.no_id is not None:
+            flt = self.flt_and(flt, self.searchobjectid(args.no_id, neg=True))
+        if args.version is not None:
+            flt = self.flt_and(flt, self.searchversion(args.version))
         if args.category is not None:
             flt = self.flt_and(flt, self.searchcategory(utils.str2list(args.category)))
         if args.port is not None:
@@ -209,6 +235,12 @@ class DB:
             flt = self.flt_and(flt, self.searchipv6())
         if args.mac is not None:
             flt = self.flt_and(flt, self.searchmac(args.mac))
+        if args.hostname is not None:
+            flt = self.flt_and(
+                flt, self.searchhostname(utils.str2regexp(args.hostname))
+            )
+        if args.domain is not None:
+            flt = self.flt_and(flt, self.searchdomain(utils.str2regexp(args.domain)))
         if args.hassh is not None:
             flt = self.flt_and(
                 flt,
@@ -242,6 +274,21 @@ class DB:
                     server=False,
                 ),
             )
+        if args.cert:
+            fingerprint = args.cert.lower().replace(":", "").replace(" ", "")
+            if not utils.HEX.search(fingerprint):
+                raise ValueError("Expected hash value, got %r" % args.cert)
+            try:
+                key = {
+                    32: "md5",
+                    40: "sha1",
+                    64: "sha256",
+                }[len(fingerprint)]
+            except KeyError as exc:
+                raise ValueError("Expected hash value, got %r" % args.cert) from exc
+            flt = self.flt_and(flt, self.searchcert(**{key: fingerprint}))
+        if args.torcert:
+            flt = self.flt_and(flt, self.searchtorcert())
         if args.ips:
 
             def _updtflt_(oflt, nflt):
@@ -882,6 +929,7 @@ class DBActive(DB):
         "ports.scripts.ssl-cert",
         "ports.scripts.ssl-ja3-client",
         "ports.scripts.ssl-ja3-server",
+        "ports.scripts.ssl-ja4-client",
         "ports.scripts.vulns",
         "ports.scripts.vulns.check_results",
         "ports.scripts.vulns.description",
@@ -950,23 +998,10 @@ class DBActive(DB):
         self.argparser.add_argument(
             "--source", metavar="SRC", help="show only results from this source"
         )
-        self.argparser.add_argument("--version", metavar="VERSION", type=int)
         self.argparser.add_argument("--timeago", metavar="SECONDS", type=int)
         self.argparser.add_argument("--no-timeago", metavar="SECONDS", type=int)
-        self.argparser.add_argument(
-            "--id",
-            metavar="ID",
-            help="show only results with this(those) ID(s)",
-            nargs="+",
-        )
-        self.argparser.add_argument(
-            "--no-id",
-            metavar="ID",
-            help="show only results WITHOUT this(those) ID(s)",
-            nargs="+",
-        )
-        self.argparser.add_argument("--hostname", metavar="NAME / ~NAME")
-        self.argparser.add_argument("--domain", metavar="NAME / ~NAME")
+        self.argparser.add_argument("--no-hostname", metavar="NAME / ~NAME")
+        self.argparser.add_argument("--no-domain", metavar="NAME / ~NAME")
         self.argparser.add_argument("--hop", metavar="IP")
         self.argparser.add_argument("--not-port", metavar="PORT")
         self.argparser.add_argument("--openport", action="store_true")
@@ -1002,7 +1037,6 @@ class DBActive(DB):
         self.argparser.add_argument(
             "--vuln-boa", "--vuln-intersil", action="store_true"
         )
-        self.argparser.add_argument("--torcert", action="store_true")
         self.argparser.add_argument("--sshkey", metavar="FINGERPRINT")
 
     def start_store_hosts(self):
@@ -1943,35 +1977,18 @@ class DBActive(DB):
             return flt
         if args.source is not None:
             flt = self.flt_and(flt, self.searchsource(args.source))
-        if args.version is not None:
-            flt = self.flt_and(flt, self.searchversion(args.version))
         if args.timeago is not None:
             flt = self.flt_and(flt, self.searchtimeago(args.timeago))
         if args.no_timeago is not None:
             flt = self.flt_and(flt, self.searchtimeago(args.no_timeago, neg=True))
-        if args.id is not None:
-            flt = self.flt_and(flt, self.searchobjectid(args.id))
-        if args.no_id is not None:
-            flt = self.flt_and(flt, self.searchobjectid(args.no_id, neg=True))
-        if args.hostname is not None:
-            if args.hostname[:1] in "!~":
-                flt = self.flt_and(
-                    flt,
-                    self.searchhostname(utils.str2regexp(args.hostname[1:]), neg=True),
-                )
-            else:
-                flt = self.flt_and(
-                    flt, self.searchhostname(utils.str2regexp(args.hostname))
-                )
-        if args.domain is not None:
-            if args.domain[:1] in "!~":
-                flt = self.flt_and(
-                    flt, self.searchdomain(utils.str2regexp(args.domain[1:]), neg=True)
-                )
-            else:
-                flt = self.flt_and(
-                    flt, self.searchdomain(utils.str2regexp(args.domain))
-                )
+        if args.no_hostname is not None:
+            flt = self.flt_and(
+                flt, self.searchhostname(utils.str2regexp(args.hostname), neg=True)
+            )
+        if args.no_domain is not None:
+            flt = self.flt_and(
+                flt, self.searchdomain(utils.str2regexp(args.domain), neg=True)
+            )
         if args.hop is not None:
             flt = self.flt_and(flt, self.searchhop(args.hop))
         if args.not_port is not None:
@@ -2066,8 +2083,6 @@ class DBActive(DB):
             flt = self.flt_and(flt, self.searchowa())
         if args.vuln_boa:
             flt = self.flt_and(flt, self.searchvulnintersil())
-        if args.torcert:
-            flt = self.flt_and(flt, self.searchtorcert())
         if args.sshkey is not None:
             flt = self.flt_and(
                 flt, self.searchsshkey(fingerprint=utils.str2regexp(args.sshkey))
@@ -3165,6 +3180,7 @@ class DBNmap(DBActive):
         self.start_store_hosts()
         with utils.open_file(fname) as fdesc:
             for line in fdesc:
+                base64_encoded = False
                 try:
                     rec = json.loads(line.decode())
                 except (UnicodeDecodeError, json.JSONDecodeError):
@@ -3212,6 +3228,13 @@ class DBNmap(DBActive):
                     script["technologies"] = rec["technologies"]
                 if "raw_header" in rec:
                     hdrs = rec["raw_header"].encode()
+                    try:
+                        # -irrb => base64
+                        hdrs = base64.decodebytes(hdrs)
+                    except binascii.Error:
+                        pass
+                    else:
+                        base64_encoded = True
                     hdrs_split = http_hdr_split.split(hdrs)
                     if hdrs_split:
                         hdr_output_list = [
@@ -3222,6 +3245,9 @@ class DBNmap(DBActive):
                         method = "GET"
                         path = "/"
                         if "request" in rec:
+                            request = rec["request"]
+                            if base64_encoded:
+                                request = base64.decodebytes(request.encode()).decode()
                             try:
                                 method, path, _ = rec["request"].split(None, 2)
                             except ValueError:
@@ -3258,8 +3284,11 @@ class DBNmap(DBActive):
                         handle_http_headers(host, port, structured, path=path)
                         raw_output = hdrs
                         if "body" in rec:
+                            raw_body = rec["body"].encode()
+                            if base64_encoded:
+                                raw_body = base64.decodebytes(raw_body)
                             # usually, the whole answer should be that
-                            raw_output += b"\r\n\r\n" + rec["body"].encode()
+                            raw_output += b"\r\n\r\n" + raw_body
                         nmap_info = utils.match_nmap_svc_fp(
                             output=raw_output,
                             proto=port["protocol"],
@@ -3285,8 +3314,15 @@ class DBNmap(DBActive):
                                 nmap_info,
                                 host.setdefault("hostnames", []),
                             )
-                if "body" in rec:
-                    body = rec["body"].encode()
+                if "body" in rec or "headless_body" in rec:
+                    try:
+                        body = rec["body"].encode()
+                        if base64_encoded:
+                            body = base64.decodebytes(body)
+                    except KeyError:
+                        body = rec[
+                            "headless_body"
+                        ].encode()  # this one won't be base64 encoded
                     port.setdefault("scripts", []).append(
                         {
                             "id": "http-content",
@@ -3294,6 +3330,22 @@ class DBNmap(DBActive):
                         }
                     )
                     handle_http_content(host, port, body)
+                if "screenshot_bytes" in rec:
+                    data = base64.decodebytes(rec["screenshot_bytes"].encode())
+                    trim_result = utils.trim_image(data)
+                    if trim_result:
+                        # When trim_result is False, the image no
+                        # longer exists after trim
+                        if trim_result is not True:
+                            # Image has been trimmed
+                            data = trim_result
+                        port["screenshot"] = "field"
+                        port["screendata"] = base64.encodebytes(data).decode()
+                        screenwords = utils.screenwords(data)
+                        if screenwords is not None:
+                            port["screenwords"] = screenwords
+                    else:
+                        port["screenshot"] = "empty"
                 if script:
                     output = []
                     if "technologies" in script:
@@ -3863,6 +3915,20 @@ class DBView(DBActive):
             const=False,
             default=None,
         )
+        self.argparser.add_argument(
+            "--ssl-ja4-client",
+            metavar="JA4-CLIENT",
+            nargs="?",
+            const=False,
+            default=None,
+        )
+        self.argparser.add_argument(
+            "--ssl-ja4-client-raw",
+            metavar="JA4-CLIENT_RAW",
+            nargs="?",
+            const=False,
+            default=None,
+        )
 
     def parse_args(self, args, flt=None):
         flt = super().parse_args(args, flt=flt)
@@ -3924,6 +3990,22 @@ class DBView(DBActive):
                             client_value_or_hash=split[1],
                         ),
                     )
+        if args.ssl_ja4_client is not None:
+            cli = args.ssl_ja4_client
+            flt = self.flt_and(
+                flt,
+                self.searchja4client(
+                    value=(None if cli is False else utils.str2regexp(cli))
+                ),
+            )
+        if args.ssl_ja4_client_raw is not None:
+            cli = args.ssl_ja4_client_raw
+            flt = self.flt_and(
+                flt,
+                self.searchja4clientraw(
+                    raw=(None if cli is False else utils.str2regexp(cli))
+                ),
+            )
         return flt
 
     @staticmethod
@@ -3976,6 +4058,67 @@ class DBView(DBActive):
             values=values,
             neg=neg,
         )
+
+    @classmethod
+    def searchja4client(
+        cls,
+        value=None,
+        raw=None,
+        ja4_a=None,
+        ja4_b=None,
+        ja4_c=None,
+        ja4_b_raw=None,
+        ja4_c_raw=None,
+        ja4_c1_raw=None,
+        ja4_c2_raw=None,
+        neg=False,
+    ):
+        values = {}
+        if value is not None:
+            values["ja4"] = value
+            # also, use ja4_* fields that are indexed
+            try:
+                if value[10] != "_":
+                    raise ValueError()
+                values["ja4_a"] = value[:10]
+                values["ja4_b"], values["ja4_c"] = value[11:].split("_", 1)
+            except (KeyError, ValueError):
+                utils.LOGGER.warning("Invalid JA4 value %r", value, exc_info=True)
+        if raw is not None:
+            try:
+                if raw[10] != "_":
+                    raise ValueError()
+                values["ja4_a"] = raw[:10]
+                # using _ja4_c_raw to prevent conflict with parameter
+                values["ja4_b_raw"], _ja4_c_raw = value[11:].split("_", 1)
+                if "_" in _ja4_c_raw:
+                    values["ja4_c1_raw"], values["ja4_c2_raw"] = _ja4_c_raw.split(
+                        "_", 1
+                    )
+                else:
+                    values["ja4_c1_raw"] = _ja4_c_raw
+                    values["ja4_c2_raw"] = ""
+            except (KeyError, ValueError):
+                utils.LOGGER.warning("Invalid JA4 raw value %r", raw, exc_info=True)
+        if ja4_a is not None:
+            values["ja4_a"] = ja4_a
+        if ja4_b is not None:
+            values["ja4_b"] = ja4_b
+        if ja4_c is not None:
+            values["ja4_c"] = ja4_c
+        if ja4_b_raw is not None:
+            values["ja4_b_raw"] = ja4_b_raw
+        if ja4_c_raw is not None:
+            if "_" in ja4_c_raw:
+                values["ja4_c1_raw"], values["ja4_c2_raw"] = ja4_c_raw.split("_", 1)
+            else:
+                values["ja4_c1_raw"] = ja4_c_raw
+                values["ja4_c2_raw"] = ""
+        if ja4_c1_raw is not None:
+            values["ja4_c1_raw"] = ja4_c1_raw
+        if ja4_c2_raw is not None:
+            values["ja4_c2_raw"] = ja4_c2_raw
+        return cls.searchscript(name="ssl-ja4-client", values=values, neg=neg)
 
 
 class _RecInfo:
@@ -4038,10 +4181,8 @@ class DBPassive(DB):
         super().__init__()
         self.output = output
         self.argparser.add_argument("--sensor")
-        self.argparser.add_argument("--torcert", action="store_true")
         self.argparser.add_argument("--dns")
         self.argparser.add_argument("--dnssub")
-        self.argparser.add_argument("--cert")
         self.argparser.add_argument("--basicauth", action="store_true")
         self.argparser.add_argument("--auth", action="store_true")
         self.argparser.add_argument("--java", action="store_true")
@@ -4066,6 +4207,20 @@ class DBPassive(DB):
         self.argparser.add_argument(
             "--ssl-ja3-client",
             metavar="JA3-CLIENT",
+            nargs="?",
+            const=False,
+            default=None,
+        )
+        self.argparser.add_argument(
+            "--ssl-ja4-client",
+            metavar="JA4-CLIENT",
+            nargs="?",
+            const=False,
+            default=None,
+        )
+        self.argparser.add_argument(
+            "--ssl-ja4-client-raw",
+            metavar="JA4-CLIENT-RAW",
             nargs="?",
             const=False,
             default=None,
@@ -4103,8 +4258,6 @@ class DBPassive(DB):
             return flt
         if args.sensor is not None:
             flt = self.flt_and(flt, self.searchsensor(utils.str2list(args.sensor)))
-        if args.torcert:
-            flt = self.flt_and(flt, self.searchtorcert())
         if args.basicauth:
             flt = self.flt_and(flt, self.searchbasicauth())
         if args.auth:
@@ -4122,11 +4275,6 @@ class DBPassive(DB):
         if args.dnssub is not None:
             flt = self.flt_and(
                 flt, self.searchdns(utils.str2regexp(args.dnssub), subdomains=True)
-            )
-        if args.cert is not None:
-            flt = self.flt_and(
-                flt,
-                self.searchcert(subject=utils.str2regexp(args.cert)),
             )
         if args.timeago is not None:
             flt = self.flt_and(
@@ -4182,6 +4330,22 @@ class DBPassive(DB):
                         ),
                     )
 
+        if args.ssl_ja4_client is not None:
+            cli = args.ssl_ja4_client
+            flt = self.flt_and(
+                flt,
+                self.searchja4client(
+                    value=(None if cli is False else utils.str2regexp(cli))
+                ),
+            )
+        if args.ssl_ja4_client_raw is not None:
+            cli = args.ssl_ja4_client_raw
+            flt = self.flt_and(
+                flt,
+                self.searchja4client(
+                    raw=(None if cli is False else utils.str2regexp(cli))
+                ),
+            )
         return flt
 
     def output_function(self, doc):
@@ -5501,6 +5665,11 @@ class MetaDB:
         if dbase is not None:
             dbase.globaldb = self
         return dbase
+
+
+# runs before the `db` global creation so that plugins have a chance
+# to add backends
+load_plugins("ivre.plugins.db", globals())
 
 
 db = MetaDB(
