@@ -1808,6 +1808,67 @@ class DuckDBTypeAdapterTests(unittest.TestCase):
             rows = list(conn.exec_driver_sql(sql))
         self.assertEqual(len(rows), 1)
 
+    @unittest.skipUnless(
+        _HAVE_DUCKDB_ENGINE,
+        "duckdb-engine is required (install with the ``duckdb`` extras)",
+    )
+    def test_inet_bind_expression_casts_parameter_on_duckdb(self):
+        # Regression: when the ``INET`` column is created on one
+        # connection (``CREATE TABLE`` on engine A) and an
+        # ``INSERT`` is later issued from a *different*
+        # connection (engine B opened against the same DuckDB
+        # file -- think ``ivre scancli --init`` followed by
+        # ``ivre scan2db <file>`` in the next subprocess), the
+        # ``duckdb-engine`` parameter binder refuses to coerce
+        # ``VARCHAR`` to ``INET`` implicitly::
+        #
+        #     Conversion Error: Type VARCHAR with value
+        #     '0.0.0.1' can't be cast to the destination type
+        #     INET
+        #
+        # ``INETLiteral.bind_expression`` adds an explicit
+        # ``CAST(? AS INET)`` around every parameter bind so
+        # the conversion is forced on the SQL side.  Pin that
+        # the compiled INSERT shows the cast and that a
+        # cross-engine insert succeeds end-to-end.
+        import os
+        import tempfile
+
+        sa = _sqlalchemy
+        from ivre.db.sql.tables import SQLINET
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "inet.duckdb")
+            url = f"duckdb:///{path}"
+
+            # Engine A: CREATE TABLE.
+            engine_a = sa.create_engine(url)
+            meta = sa.MetaData()
+            hosts = sa.Table(
+                "hosts",
+                meta,
+                sa.Column("id", sa.Integer, primary_key=True, autoincrement=False),
+                sa.Column("addr", SQLINET),
+            )
+            meta.create_all(engine_a)
+            engine_a.dispose()
+
+            # Compile-time pin: every INET bind goes through
+            # ``CAST(? AS INET)``.
+            engine_b = sa.create_engine(url)
+            stmt = sa.insert(hosts)
+            compiled = str(stmt.compile(dialect=engine_b.dialect))
+            self.assertIn("CAST(", compiled)
+            self.assertIn("AS INET)", compiled)
+
+            # Run-time pin: cross-engine insert + read back.
+            with engine_b.connect() as conn:
+                conn.execute(stmt, {"id": 1, "addr": "0.0.0.1"})
+                conn.execute(stmt, {"id": 2, "addr": "2001:db8::1"})
+                conn.commit()
+                rows = list(conn.execute(sa.select(hosts).order_by(hosts.c.id)))
+            self.assertEqual(len(rows), 2)
+
 
 # ---------------------------------------------------------------------
 # DuckDBBackendBootstrapTests -- pin the wiring of the new
@@ -1967,19 +2028,97 @@ class DuckDBBackendBootstrapTests(unittest.TestCase):
         self.assertTrue(_is_unsupported_on_duckdb(array_idx))
         self.assertFalse(_is_unsupported_on_duckdb(plain))
 
-    def test_normalise_fk_action(self):
-        from ivre.db.sql.duckdb import _normalise_fk_action
+    def test_decode_portlist_handles_pg_string_and_duckdb_list(self):
+        # Regression: the ``portlist:*`` topvalues query
+        # composes
+        # ``func.array_agg(tuple_(port.protocol, port.port))``
+        # and post-processes the per-row result into
+        # ``[(proto, port), ...]``.  PostgreSQL serialises the
+        # column as a ``record[]`` *string*, e.g.
+        # ``'{"(tcp,80)","(tcp,443)"}'``; DuckDB returns a
+        # native ``list[tuple[str, int]]`` instead.  The
+        # post-processor used to assume the PG string shape
+        # and crashed on DuckDB with::
+        #
+        #     AttributeError: 'list' object has no attribute
+        #     'split'
+        #
+        # Pin both decode paths on
+        # :func:`ivre.db.sql.postgres._decode_portlist`.
+        from ivre.db.sql.postgres import _decode_portlist
 
-        # CASCADE / SET NULL / SET DEFAULT collapse to None
-        # (i.e. the DuckDB-implicit RESTRICT).
-        self.assertIsNone(_normalise_fk_action("CASCADE"))
-        self.assertIsNone(_normalise_fk_action("cascade"))
-        self.assertIsNone(_normalise_fk_action("SET NULL"))
-        self.assertIsNone(_normalise_fk_action("SET DEFAULT"))
-        # RESTRICT / NO ACTION / None pass through unchanged.
-        self.assertEqual(_normalise_fk_action("RESTRICT"), "RESTRICT")
-        self.assertEqual(_normalise_fk_action("NO ACTION"), "NO ACTION")
-        self.assertIsNone(_normalise_fk_action(None))
+        # PG ``record[]`` literal.
+        self.assertEqual(
+            _decode_portlist('{"(tcp,80)","(tcp,443)","(udp,53)"}'),
+            [("tcp", 80), ("tcp", 443), ("udp", 53)],
+        )
+        # DuckDB ``LIST(STRUCT(...))`` round-trip.
+        self.assertEqual(
+            _decode_portlist([("tcp", 80), ("tcp", 443), ("udp", 53)]),
+            [("tcp", 80), ("tcp", 443), ("udp", 53)],
+        )
+        # Empty cases on both shapes.
+        self.assertEqual(_decode_portlist("{}"), [])
+        self.assertEqual(_decode_portlist([]), [])
+
+    @unittest.skipUnless(
+        _HAVE_DUCKDB_ENGINE,
+        "duckdb-engine is required (install with the ``duckdb`` extras)",
+    )
+    def test_init_strips_foreign_keys_on_duckdb(self):
+        # Regression: ``ON DELETE CASCADE`` is unsupported by
+        # DuckDB; downgrading the action to the implicit
+        # ``RESTRICT`` would keep the FK *check*, which then
+        # breaks IVRE's scan-rooted delete paths (a single
+        # ``DELETE FROM scan WHERE id = ?`` relies on the
+        # cascade to clean up child rows in
+        # ``port`` / ``hostname`` / ``trace`` / ``hop`` /
+        # ``tag`` / ``association_scan_*`` / ``script``).
+        # ``DuckDBMixin.init`` therefore drops the FK
+        # constraints entirely on DuckDB and restores them
+        # afterwards.  Pin both halves of that contract.
+        import os
+        import tempfile
+
+        from ivre.db import DBNmap
+        from ivre.db.sql.tables import N_Hostname
+
+        # Snapshot the FK declarations on the source metadata
+        # (they should NOT be mutated permanently).
+        original_fkc_count = len(N_Hostname.__table__.foreign_key_constraints)
+        self.assertGreater(
+            original_fkc_count, 0, "test fixture: N_Hostname must have FKs to start"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ivre.duckdb")
+            db = DBNmap.from_url(f"duckdb:///{path}")
+            db.init()
+            db.db.dispose()
+
+            # Source metadata's FKs are restored to their
+            # original count.
+            self.assertEqual(
+                len(N_Hostname.__table__.foreign_key_constraints),
+                original_fkc_count,
+            )
+
+            # The persisted DuckDB schema has *no* FK
+            # constraints (only PK / NOT NULL).
+            import duckdb
+
+            con = duckdb.connect(path, read_only=True)
+            try:
+                rows = con.execute(
+                    "SELECT constraint_type FROM duckdb_constraints() "
+                    "WHERE schema_name = 'main' AND table_name = 'n_hostname'"
+                ).fetchall()
+            finally:
+                con.close()
+            kinds = {r[0] for r in rows}
+            self.assertNotIn("FOREIGN KEY", kinds, f"got constraints: {kinds}")
+            # PK / NOT NULL must still be there.
+            self.assertIn("PRIMARY KEY", kinds)
 
     # --- tables.py Sequence-based PK refactor ---------------------
     def test_pk_columns_use_sequence_default(self):
@@ -2234,6 +2373,91 @@ class DuckDBBackendBootstrapTests(unittest.TestCase):
                     or {"v_scan", "v_port", "v_hostname"} <= names
                     or {"passive"} <= names
                 )
+
+    @unittest.skipUnless(
+        _HAVE_DUCKDB_ENGINE,
+        "duckdb-engine is required (install with the ``duckdb`` extras)",
+    )
+    def test_write_result_survives_connection_close_on_duckdb(self):
+        # Regression: every existing ``self._write(stmt).fetchone()[0]``
+        # call site (e.g. in :meth:`PostgresDB._store_host` for the
+        # ``RETURNING n_scan.id`` upsert, in
+        # :meth:`PostgresDBNmap._store_host` for ports / scripts
+        # / hostnames, …) reads from the cursor *after*
+        # :meth:`SQLDB._write` has exited the transactional
+        # ``with`` block and returned the connection to the pool.
+        # On PostgreSQL (psycopg2) this works by accident
+        # because psycopg2 pre-buffers rows on the client side;
+        # on DuckDB (``duckdb-engine``) the cursor's result set
+        # is tied to the live connection and raises::
+        #
+        #     InvalidInputException: No open result set
+        #
+        # Pin that ``self._write(...)`` returns a buffered
+        # result object whose ``fetchone()`` works after the
+        # underlying connection has closed.
+        from ivre.db import DBNmap
+
+        db = DBNmap.from_url("duckdb:///:memory:")
+        db.init()
+        # Issue a RETURNING-flavoured insert via ``_write`` and
+        # read the row *outside* the writer's ``with`` block.
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        result = db._write(  # pylint: disable=protected-access
+            pg_insert(db.tables.scan)
+            .values(
+                addr="192.0.2.1",
+                source="test",
+                schema_version=22,
+            )
+            .on_conflict_do_nothing()
+            .returning(db.tables.scan.id)
+        )
+        # The connection is now closed; the read must still
+        # succeed (would raise ``InvalidInputException`` on
+        # DuckDB without ``_BufferedResult``).
+        row = result.fetchone()
+        self.assertIsNotNone(row)
+        scan_id = row[0]
+        self.assertGreater(scan_id, 0)
+
+    @unittest.skipUnless(
+        _HAVE_DUCKDB_ENGINE,
+        "duckdb-engine is required (install with the ``duckdb`` extras)",
+    )
+    def test_init_idempotent_on_file_backed_duckdb(self):
+        # Regression: a single SQLAlchemy engine reuses the same
+        # DuckDB session across :meth:`SQLDB.drop` and
+        # :meth:`SQLDB.create`, and DuckDB's catalog refuses to
+        # commit a ``CREATE TABLE`` that re-introduces a name
+        # whose previous incarnation was dropped within the same
+        # session::
+        #
+        #     TransactionException: Failed to commit: Could not
+        #     commit creation of dependency, subject "n_category"
+        #     has been deleted
+        #
+        # The bug only fires the *second* time ``init()`` runs
+        # against a pre-existing DuckDB file (the first init
+        # creates an empty file with no prior catalog state to
+        # conflict with).  Pin that the override recycles the
+        # engine between drop and create, so calling ``init()``
+        # twice in a row on the same file-backed database
+        # succeeds.
+        import os
+        import tempfile
+
+        from ivre.db import DBNmap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ivre.duckdb")
+            url = f"duckdb:///{path}"
+            for round_no in (1, 2, 3):
+                with self.subTest(round=round_no):
+                    db = DBNmap.from_url(url)
+                    db.init()
+                    db.db.dispose()
 
     @unittest.skipUnless(
         _HAVE_DUCKDB_ENGINE,
