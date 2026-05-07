@@ -4771,17 +4771,32 @@ class IvreTests(unittest.TestCase):
         self.assertTrue(all(len(d) == ncolumns for d in data))
         self.check_value("view_features_versions_noyieldall_FRDE_ndata", len(data))
 
-        # Full-text. Skipped on the AWS DocumentDB flavour: the
+        # Full-text.  Every :class:`DBActive` backend now ships
+        # a ``searchtext()`` method (Mongo via the ``$text``
+        # operator, PG via ``to_tsvector @@ plainto_tsquery``,
+        # DuckDB via the FTS extension's ``match_bm25``,
+        # Elastic via ``multi_match`` over ``text_fields``).
+        # Still skipped on the AWS DocumentDB flavour: the
         # backend has no text-index facility and no ``$text``
-        # operator. ``MongoDBView.searchtext`` would fail at
+        # operator -- ``MongoDBView.searchtext`` would fail at
         # query time on a real DocumentDB instance.
-        if DATABASE == "mongo" and BACKEND_FLAVOR != "documentdb":
+        #
+        # The exact match count diverges by backend because
+        # the tokenisation / stemming / stopword rules differ
+        # (Mongo's English text index, PostgreSQL's
+        # ``to_tsvector('english', ...)`` Snowball stemmer,
+        # DuckDB's ``match_bm25`` Snowball stemmer with its
+        # own stopword list, Elasticsearch's standard
+        # analyzer).  The ``DATABASE`` suffix scopes the
+        # recorded value per-backend so each one pins its own
+        # count without one backend's rules masking another.
+        if BACKEND_FLAVOR != "documentdb":
             self.check_value(
-                "view_count_text_honeypot",
+                f"view_count_text_honeypot_{DATABASE}",
                 ivre.db.db.view.count(ivre.db.db.view.searchtext("honeypot")),
             )
             self.check_value(
-                "view_count_text_password",
+                f"view_count_text_password_{DATABASE}",
                 ivre.db.db.view.count(ivre.db.db.view.searchtext("password")),
             )
 
